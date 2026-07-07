@@ -159,6 +159,8 @@ void hyperv_report_panic(struct pt_regs *regs, long err, bool in_die)
 {
 	static bool	panic_reported;
 	u64		guest_id;
+	u64		crash_ctl = HV_CRASH_CTL_CRASH_NOTIFY;
+	u64		page_gpa = READ_ONCE(hv_crash_page_gpa);
 
 	/* Don't report a panic to Hyper-V if we're not going to panic */
 	if (in_die && !panic_on_oops)
@@ -186,12 +188,24 @@ void hyperv_report_panic(struct pt_regs *regs, long err, bool in_die)
 	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P0, err);
 	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P1, guest_id);
 	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P2, regs->pc);
-	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P3, regs->sp);
-	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P4, 0);
+
+	if (page_gpa) {
+		/*
+		 * Userspace registered a shared crash page; point the host
+		 * at it via P3/P4 and set the CRASH_NOTIFY_MSG bit so the
+		 * host reads the panic message from the page.
+		 */
+		hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P3, page_gpa);
+		hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P4, PAGE_SIZE);
+		crash_ctl |= HV_CRASH_CTL_CRASH_NOTIFY_MSG;
+	} else {
+		hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P3, regs->sp);
+		hv_set_vpreg(HV_REGISTER_GUEST_CRASH_P4, 0);
+	}
 
 	/*
 	 * Let Hyper-V know there is crash data available
 	 */
-	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_CTL, HV_CRASH_CTL_CRASH_NOTIFY);
+	hv_set_vpreg(HV_REGISTER_GUEST_CRASH_CTL, crash_ctl);
 }
 EXPORT_SYMBOL_GPL(hyperv_report_panic);

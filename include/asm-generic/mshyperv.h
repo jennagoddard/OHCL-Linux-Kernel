@@ -346,6 +346,7 @@ extern struct hv_vp_assist_page **hv_vp_assist_page;
 const char *hv_result_to_string(u64 hv_status);
 int hv_result_to_errno(u64 status);
 void hyperv_report_panic(struct pt_regs *regs, long err, bool in_die);
+extern u64 hv_crash_page_gpa;
 bool hv_is_hyperv_initialized(void);
 bool hv_is_hibernation_supported(void);
 enum hv_isolation_type hv_get_isolation_type(void);

@@ -29,6 +29,8 @@
 #include <linux/slab.h>
 #include <linux/dma-map-ops.h>
 #include <linux/set_memory.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 #include <hyperv/hvhdk.h>
 #include <asm/mshyperv.h>
 
@@ -109,6 +111,42 @@ void __init hv_common_free(void)
 }
 
 static void *hv_panic_page;
+
+/*
+ * GPA of a guest-shared page that userspace has registered to receive a
+ * panic message. When non-zero, hyperv_report_panic() points the host at
+ * this page via the CRASH_P3/P4 MSRs and sets HV_CRASH_CTL_CRASH_NOTIFY_MSG
+ * so the host reads the panic message from guest memory. Userspace (e.g.
+ * OpenHCL VTL2) sets and clears this via /sys/hypervisor/crash_page_gpa;
+ * clearing it before making the page private is what keeps the guarantee
+ * that the host cannot read the page after secrets are unlocked.
+ */
+u64 hv_crash_page_gpa __read_mostly;
+EXPORT_SYMBOL_GPL(hv_crash_page_gpa);
+
+static ssize_t crash_page_gpa_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0x%llx\n", READ_ONCE(hv_crash_page_gpa));
+}
+
+static ssize_t crash_page_gpa_store(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
+{
+	u64 val;
+	int ret;
+
+	ret = kstrtou64(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(hv_crash_page_gpa, val);
+	return count;
+}
+
+static struct kobj_attribute crash_page_gpa_attr =
+	__ATTR(crash_page_gpa, 0600, crash_page_gpa_show, crash_page_gpa_store);
 
 /*
  * Boolean to control whether to report panic messages over Hyper-V.
@@ -364,6 +402,14 @@ int __init hv_common_init(void)
 		register_die_notifier(&hyperv_die_report_block);
 		atomic_notifier_chain_register(&panic_notifier_list,
 					       &hyperv_panic_report_block);
+
+		/*
+		 * Expose /sys/hypervisor/crash_page_gpa so userspace can
+		 * register a shared page that will receive the panic message
+		 * on crash. Only meaningful when crash MSRs are available.
+		 */
+		if (sysfs_create_file(hypervisor_kobj, &crash_page_gpa_attr.attr))
+			pr_err("Hyper-V: failed to create crash_page_gpa sysfs file\n");
 	}
 
 	/*

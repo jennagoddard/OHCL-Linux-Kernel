@@ -591,6 +591,8 @@ void hyperv_report_panic(struct pt_regs *regs, long err, bool in_die)
 {
 	static bool panic_reported;
 	u64 guest_id;
+	u64 crash_ctl = HV_CRASH_CTL_CRASH_NOTIFY;
+	u64 page_gpa = READ_ONCE(hv_crash_page_gpa);
 
 	if (in_die && !panic_on_oops)
 		return;
@@ -609,13 +611,26 @@ void hyperv_report_panic(struct pt_regs *regs, long err, bool in_die)
 	wrmsrq(HV_X64_MSR_CRASH_P0, err);
 	wrmsrq(HV_X64_MSR_CRASH_P1, guest_id);
 	wrmsrq(HV_X64_MSR_CRASH_P2, regs->ip);
-	wrmsrq(HV_X64_MSR_CRASH_P3, regs->ax);
-	wrmsrq(HV_X64_MSR_CRASH_P4, regs->sp);
+
+	if (page_gpa) {
+		/*
+		 * Userspace registered a shared crash page; point the host at
+		 * it and ask it to consume the panic message. RAX/RSP are
+		 * sacrificed here — key register state can be encoded in the
+		 * page contents by userspace if desired.
+		 */
+		wrmsrq(HV_X64_MSR_CRASH_P3, page_gpa);
+		wrmsrq(HV_X64_MSR_CRASH_P4, PAGE_SIZE);
+		crash_ctl |= HV_CRASH_CTL_CRASH_NOTIFY_MSG;
+	} else {
+		wrmsrq(HV_X64_MSR_CRASH_P3, regs->ax);
+		wrmsrq(HV_X64_MSR_CRASH_P4, regs->sp);
+	}
 
 	/*
 	 * Let Hyper-V know there is crash data available
 	 */
-	wrmsrq(HV_X64_MSR_CRASH_CTL, HV_CRASH_CTL_CRASH_NOTIFY);
+	wrmsrq(HV_X64_MSR_CRASH_CTL, crash_ctl);
 }
 EXPORT_SYMBOL_GPL(hyperv_report_panic);
 
