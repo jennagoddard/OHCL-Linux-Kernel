@@ -19,6 +19,8 @@
 #include <linux/context_tracking.h>
 #include <linux/eventfd.h>
 #include <linux/poll.h>
+#include <linux/ratelimit.h>
+#include <linux/workqueue.h>
 #include <linux/file.h>
 #include <linux/pagemap.h>
 #include <linux/user-return-notifier.h>
@@ -364,6 +366,455 @@ static struct page *mshv_vtl_cpu_reg_page(int cpu)
 	return *per_cpu_ptr(&mshv_vtl_per_cpu.reg_page, cpu);
 }
 
+#if defined(CONFIG_X86_64) && defined(CONFIG_SEV_GUEST)
+/*
+ * SNP SINT0 delivery diagnostics.
+ *
+ * Without the intercept page, the hypervisor reports lower VTL events that are
+ * not VMSA exits (e.g. HvMessageTypeUnrecoverableException) by posting a
+ * message to the VTL2 SINT0 slot and interrupting VTL2. Proxy interrupts share
+ * the same slot. Each CPU records its recent VTL transitions, SINT0 slot
+ * observations and IPIs into a ring. The ring is printed when one lower VTL
+ * run exceeds snp_trace_stall_ms, when an unexpected SINT0 message is
+ * forwarded to user mode, or when the watchdog finds a CPU that is still in
+ * the lower VTL (or halted with pending proxy interrupts) for longer than
+ * snp_trace_stall_ms.
+ */
+static bool snp_trace = true;
+module_param(snp_trace, bool, 0644);
+MODULE_PARM_DESC(snp_trace, "Record SNP VTL transition and SINT0 trace events");
+
+static unsigned int snp_trace_stall_ms = 2000;
+module_param(snp_trace_stall_ms, uint, 0644);
+MODULE_PARM_DESC(snp_trace_stall_ms,
+		 "Dump the SNP trace when a lower VTL run lasts this many ms (0 disables)");
+
+static unsigned int snp_trace_watchdog_ms = 1000;
+module_param(snp_trace_watchdog_ms, uint, 0644);
+MODULE_PARM_DESC(snp_trace_watchdog_ms,
+		 "Period of the SNP stuck CPU watchdog in ms (0 disables; boot-time only)");
+
+enum mshv_snp_trace_kind {
+	SNP_TR_NONE,
+	SNP_TR_ENTER,
+	SNP_TR_HALT,
+	SNP_TR_RETURN,
+	SNP_TR_WAKE,
+	SNP_TR_DISPATCH,
+	SNP_TR_PRE_MSG,
+	SNP_TR_MSG,
+	SNP_TR_ISR,
+	SNP_TR_IPI,
+	SNP_TR_EINTR,
+	SNP_TR_KINDS,
+};
+
+static const char *const mshv_snp_trace_names[SNP_TR_KINDS] = {
+	[SNP_TR_NONE]		= "none",
+	[SNP_TR_ENTER]		= "enter",
+	[SNP_TR_HALT]		= "halt",
+	[SNP_TR_RETURN]		= "return",
+	[SNP_TR_WAKE]		= "wake",
+	[SNP_TR_DISPATCH]	= "dispatch",
+	[SNP_TR_PRE_MSG]	= "pre_msg",
+	[SNP_TR_MSG]		= "msg",
+	[SNP_TR_ISR]		= "isr",
+	[SNP_TR_IPI]		= "ipi",
+	[SNP_TR_EINTR]		= "eintr",
+};
+
+/* Field labels for each event kind; "flags" packs run flags | offload << 32 | vtl << 40. */
+static const char *const mshv_snp_trace_labels[SNP_TR_KINDS][6] = {
+	[SNP_TR_NONE]		= { "a", "b", "c", "d", "e", "f" },
+	[SNP_TR_ENTER]		= { "flags", "exit", "vintr", "rip", "event_inj", "int_info" },
+	[SNP_TR_HALT]		= { "flags", "exit", "vintr", "rip", "event_inj", "int_info" },
+	[SNP_TR_RETURN]		= { "ns", "exit", "info1", "info2", "vintr", "rip" },
+	[SNP_TR_WAKE]		= { "ns", "exit", "info1", "info2", "vintr", "rip" },
+	[SNP_TR_DISPATCH]	= { "vmsa_ok", "synic_ok", "ran", "flags", "exit", "user_msg" },
+	[SNP_TR_PRE_MSG]	= { "hdr_hi", "p0", "p1", "p2", "p3", "p4" },
+	[SNP_TR_MSG]		= { "to_user", "p0", "p1", "p2", "p3", "p4" },
+	[SNP_TR_ISR]		= { "action", "p0", "p1", "p2", "p3", "p4" },
+	[SNP_TR_IPI]		= { "icr_lo", "dest", "targets", "kicked", "ret", "self" },
+	[SNP_TR_EINTR]		= { "cancel", "scan_irr", "flags", "a", "b", "c" },
+};
+
+struct mshv_snp_trace_ev {
+	u64 ns;
+	u64 v[6];
+	u32 sint0_type;
+	u8 kind;
+	u8 sint0_flags;
+	u8 irqs_off;
+	u8 reserved;
+};
+
+#define MSHV_SNP_TRACE_ENTRIES 256
+
+struct mshv_snp_trace {
+	struct mshv_snp_trace_ev ev[MSHV_SNP_TRACE_ENTRIES];
+	u32 next;
+	/* Nonzero while this CPU is in the lower VTL / halted in VTL2. */
+	u64 lower_since_ns;
+	u64 halt_since_ns;
+	u64 isr_count;
+	u64 sint0_isr_count;
+	u64 enter_count;
+	const char *dump_why;
+	/* Owned by the watchdog CPU. */
+	u64 wd_reported_since;
+	u64 wd_last_report_ns;
+	u32 wd_last_type;
+	u8 wd_last_flags;
+};
+
+static DEFINE_PER_CPU(struct mshv_snp_trace, mshv_snp_trace);
+static DEFINE_RATELIMIT_STATE(mshv_snp_trace_dump_rs, 60 * HZ, 8);
+static DEFINE_RATELIMIT_STATE(mshv_snp_trace_wd_rs, 60 * HZ, 20);
+
+static u64 mshv_snp_read_vmsa_reg(struct mshv_vtl_run *run,
+				  struct sev_es_save_area *vmsa, size_t offset);
+
+static bool mshv_snp_trace_on(void)
+{
+	return READ_ONCE(snp_trace) && hv_isolation_type_snp();
+}
+
+static struct hv_message *mshv_snp_trace_sint0(int cpu)
+{
+	struct hv_per_cpu_context *ctx = per_cpu_ptr(hv_context.cpu_context, cpu);
+	void *page = READ_ONCE(ctx->synic_message_page);
+
+	if (!page)
+		return NULL;
+	return (struct hv_message *)page + HV_SYNIC_INTERCEPTION_SINT_INDEX;
+}
+
+static void mshv_snp_trace_rec(u8 kind, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f)
+{
+	struct mshv_snp_trace_ev *ev;
+	struct mshv_snp_trace *t;
+	struct hv_message *msg;
+	unsigned long flags;
+
+	if (!mshv_snp_trace_on())
+		return;
+
+	/*
+	 * The ISR can record on this CPU, so keep each record atomic. Use the
+	 * raw variants: the play idle enter mode calls this with RCU idle.
+	 */
+	raw_local_irq_save(flags);
+	t = this_cpu_ptr(&mshv_snp_trace);
+	ev = &t->ev[t->next % MSHV_SNP_TRACE_ENTRIES];
+	ev->ns = ktime_get_mono_fast_ns();
+	ev->kind = kind;
+	ev->irqs_off = irqs_disabled_flags(flags);
+	ev->v[0] = a;
+	ev->v[1] = b;
+	ev->v[2] = c;
+	ev->v[3] = d;
+	ev->v[4] = e;
+	ev->v[5] = f;
+	msg = mshv_snp_trace_sint0(smp_processor_id());
+	ev->sint0_type = msg ? READ_ONCE(msg->header.message_type) : U32_MAX;
+	ev->sint0_flags = msg ? READ_ONCE(msg->header.message_flags.asu8) : 0;
+	WRITE_ONCE(t->next, t->next + 1);
+	raw_local_irq_restore(flags);
+}
+
+static void mshv_snp_trace_rec_msg(u8 kind, u64 a, const struct hv_message *msg)
+{
+	mshv_snp_trace_rec(kind, a, READ_ONCE(msg->u.payload[0]),
+			   READ_ONCE(msg->u.payload[1]), READ_ONCE(msg->u.payload[2]),
+			   READ_ONCE(msg->u.payload[3]), READ_ONCE(msg->u.payload[4]));
+}
+
+static void mshv_snp_trace_dump(int cpu, const char *why, u32 max)
+{
+	struct mshv_snp_trace *t = per_cpu_ptr(&mshv_snp_trace, cpu);
+	u64 now = ktime_get_mono_fast_ns();
+	u32 next = READ_ONCE(t->next);
+	u32 n = min3(next, max, (u32)MSHV_SNP_TRACE_ENTRIES);
+	u32 i;
+
+	pr_warn("mshv_vtl: snp-trace cpu%d dump (%s): now=%llu isr=%llu sint0_isr=%llu enters=%llu events=%u\n",
+		cpu, why, now, READ_ONCE(t->isr_count), READ_ONCE(t->sint0_isr_count),
+		READ_ONCE(t->enter_count), n);
+
+	for (i = next - n; i != next; i++) {
+		const struct mshv_snp_trace_ev *ev = &t->ev[i % MSHV_SNP_TRACE_ENTRIES];
+		u8 kind = ev->kind < SNP_TR_KINDS ? ev->kind : SNP_TR_NONE;
+		const char *const *l = mshv_snp_trace_labels[kind];
+		u64 ago = now > ev->ns ? now - ev->ns : 0;
+
+		pr_warn("mshv_vtl: snp-trace cpu%d -%llu.%06llus %s %s=%#llx %s=%#llx %s=%#llx %s=%#llx %s=%#llx %s=%#llx sint0=%#x/%#x%s\n",
+			cpu, ago / NSEC_PER_SEC, (ago % NSEC_PER_SEC) / NSEC_PER_USEC,
+			mshv_snp_trace_names[kind],
+			l[0], ev->v[0], l[1], ev->v[1], l[2], ev->v[2],
+			l[3], ev->v[3], l[4], ev->v[4], l[5], ev->v[5],
+			ev->sint0_type, ev->sint0_flags, ev->irqs_off ? " irqoff" : "");
+	}
+}
+
+/*
+ * Prints a dump requested from IRQ-off context. Call with IRQs enabled. Only
+ * the newest events are printed here; the watchdog prints the whole ring.
+ */
+static void mshv_snp_trace_flush(void)
+{
+	struct mshv_snp_trace *t = this_cpu_ptr(&mshv_snp_trace);
+	const char *why = READ_ONCE(t->dump_why);
+
+	if (likely(!why))
+		return;
+	WRITE_ONCE(t->dump_why, NULL);
+	if (__ratelimit(&mshv_snp_trace_dump_rs))
+		mshv_snp_trace_dump(smp_processor_id(), why, 64);
+}
+
+static struct sev_es_save_area *mshv_snp_trace_vmsa(void)
+{
+	struct page *vmsa_page = *this_cpu_ptr(&mshv_vtl_per_cpu.vmsa_page);
+
+	return vmsa_page ? page_address(vmsa_page) : NULL;
+}
+
+static u64 mshv_snp_trace_exit_code(void)
+{
+	struct sev_es_save_area *vmsa = mshv_snp_trace_vmsa();
+
+	return vmsa ? vmsa->guest_exit_code : 0;
+}
+
+static u64 mshv_snp_trace_rip(struct mshv_vtl_run *run, struct sev_es_save_area *vmsa)
+{
+	return vmsa ? mshv_snp_read_vmsa_reg(run, vmsa, offsetof(struct sev_es_save_area, rip)) : 0;
+}
+
+static u32 mshv_snp_trace_user_msg(struct mshv_vtl_run *run)
+{
+	return READ_ONCE(((struct hv_message *)run->exit_message)->header.message_type);
+}
+
+/* Called with IRQs off right before the VMGEXIT or halt that enters the lower VTL. */
+static void mshv_snp_trace_enter(struct mshv_vtl_run *run, u8 vtl, bool halt)
+{
+	struct mshv_snp_trace *t = this_cpu_ptr(&mshv_snp_trace);
+	struct sev_es_save_area *vmsa = vtl ? NULL : mshv_snp_trace_vmsa();
+	u64 flags = READ_ONCE(run->flags) | (u64)READ_ONCE(run->offload_flags) << 32 |
+		    (u64)vtl << 40;
+	u64 now;
+
+	if (!mshv_snp_trace_on())
+		return;
+
+	t->enter_count++;
+	mshv_snp_trace_rec(halt ? SNP_TR_HALT : SNP_TR_ENTER, flags,
+			   vmsa ? vmsa->guest_exit_code : 0,
+			   vmsa ? vmsa->vintr_ctrl : 0,
+			   mshv_snp_trace_rip(run, vmsa),
+			   vmsa ? vmsa->event_inj : 0,
+			   vmsa ? vmsa->guest_exit_int_info : 0);
+	now = t->ev[(t->next - 1) % MSHV_SNP_TRACE_ENTRIES].ns;
+	if (halt)
+		WRITE_ONCE(t->halt_since_ns, now);
+	else
+		WRITE_ONCE(t->lower_since_ns, now);
+}
+
+/* Called right after the VMGEXIT or halt returns, before the exit is dispatched. */
+static void mshv_snp_trace_return(struct mshv_vtl_run *run, u8 vtl, bool halt)
+{
+	struct mshv_snp_trace *t = this_cpu_ptr(&mshv_snp_trace);
+	struct sev_es_save_area *vmsa = vtl ? NULL : mshv_snp_trace_vmsa();
+	u64 since = halt ? READ_ONCE(t->halt_since_ns) : READ_ONCE(t->lower_since_ns);
+	u64 now = ktime_get_mono_fast_ns();
+	u64 elapsed = since && now > since ? now - since : 0;
+	u64 stall_ns = (u64)READ_ONCE(snp_trace_stall_ms) * NSEC_PER_MSEC;
+
+	if (halt)
+		WRITE_ONCE(t->halt_since_ns, 0);
+	else
+		WRITE_ONCE(t->lower_since_ns, 0);
+
+	if (!mshv_snp_trace_on())
+		return;
+
+	mshv_snp_trace_rec(halt ? SNP_TR_WAKE : SNP_TR_RETURN, elapsed,
+			   vmsa ? vmsa->guest_exit_code : 0,
+			   vmsa ? vmsa->guest_exit_info_1 : 0,
+			   vmsa ? vmsa->guest_exit_info_2 : 0,
+			   vmsa ? vmsa->vintr_ctrl : 0,
+			   mshv_snp_trace_rip(run, vmsa));
+
+	if (!halt && stall_ns && elapsed >= stall_ns)
+		WRITE_ONCE(t->dump_why, "long lower VTL run");
+}
+
+static void mshv_snp_trace_count_isr(void)
+{
+	if (hv_isolation_type_snp())
+		this_cpu_inc(mshv_snp_trace.isr_count);
+}
+
+static void mshv_snp_trace_isr(struct hv_message *msg, u32 message_type, u64 action)
+{
+	if (!mshv_snp_trace_on())
+		return;
+	this_cpu_inc(mshv_snp_trace.sint0_isr_count);
+	mshv_snp_trace_rec_msg(SNP_TR_ISR, action, msg);
+}
+
+/* Records a SINT0 message consumed by the run loop, before it is EOM'd. */
+static void mshv_snp_trace_msg(struct hv_message *msg, u32 msg_type, bool to_user)
+{
+	if (!mshv_snp_trace_on())
+		return;
+	if (msg_type == HVMSG_NONE && !(READ_ONCE(msg->header.message_flags.asu8) & 1))
+		return;
+
+	mshv_snp_trace_rec_msg(SNP_TR_MSG, to_user, msg);
+
+	if (to_user && msg_type != HVMSG_X64_EXCEPTION_INTERCEPT &&
+	    msg_type != HVMSG_SYNIC_SINT_DELIVERABLE)
+		WRITE_ONCE(this_cpu_ptr(&mshv_snp_trace)->dump_why,
+			   "unexpected SINT0 message to user");
+}
+
+static bool mshv_snp_trace_proxy_irr_pending(struct mshv_vtl_run *run)
+{
+	int i;
+
+	if (READ_ONCE(run->scan_proxy_irr))
+		return true;
+	for (i = 0; i < 8; i++)
+		if (READ_ONCE(run->proxy_irr[i]))
+			return true;
+	return false;
+}
+
+static void mshv_snp_trace_check_cpu(int cpu, u64 now, u64 stall_ns)
+{
+	struct mshv_snp_trace *t = per_cpu_ptr(&mshv_snp_trace, cpu);
+	struct mshv_vtl_run *run = mshv_vtl_cpu_run(cpu);
+	u64 lower = READ_ONCE(t->lower_since_ns);
+	u64 halt = READ_ONCE(t->halt_since_ns);
+	struct hv_message *msg;
+	const char *state;
+	u64 since, hdr[2] = {}, payload[6] = {};
+	u32 type = U32_MAX;
+	u8 mflags = 0;
+	bool first;
+	int i;
+
+	if (!run)
+		return;
+	if (lower && now > lower && now - lower >= stall_ns) {
+		since = lower;
+		state = "in lower VTL";
+	} else if (halt && now > halt && now - halt >= stall_ns &&
+		   mshv_snp_trace_proxy_irr_pending(run)) {
+		since = halt;
+		state = "halted with pending proxy IRR";
+	} else {
+		return;
+	}
+
+	msg = mshv_snp_trace_sint0(cpu);
+	if (msg) {
+		type = READ_ONCE(msg->header.message_type);
+		mflags = READ_ONCE(msg->header.message_flags.asu8);
+		memcpy(hdr, &msg->header, sizeof(hdr));
+		for (i = 0; i < ARRAY_SIZE(payload); i++)
+			payload[i] = READ_ONCE(msg->u.payload[i]);
+	}
+
+	first = t->wd_reported_since != since;
+	if (!first && type == t->wd_last_type && mflags == t->wd_last_flags &&
+	    now - t->wd_last_report_ns < 30ULL * NSEC_PER_SEC)
+		return;
+	if (!__ratelimit(&mshv_snp_trace_wd_rs))
+		return;
+
+	t->wd_reported_since = since;
+	t->wd_last_report_ns = now;
+	t->wd_last_type = type;
+	t->wd_last_flags = mflags;
+
+	pr_warn("mshv_vtl: snp-trace watchdog: cpu%d %s for %llu ms: sint0 type=%#x flags=%#x hdr=%016llx:%016llx payload=%016llx %016llx %016llx %016llx %016llx %016llx isr=%llu sint0_isr=%llu enters=%llu run.flags=%#x offload=%#x scan_proxy_irr=%u proxy_irr=%*phN\n",
+		cpu, state, (now - since) / NSEC_PER_MSEC, type, mflags, hdr[0], hdr[1],
+		payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+		READ_ONCE(t->isr_count), READ_ONCE(t->sint0_isr_count),
+		READ_ONCE(t->enter_count), READ_ONCE(run->flags),
+		READ_ONCE(run->offload_flags), READ_ONCE(run->scan_proxy_irr),
+		(int)sizeof(run->proxy_irr), run->proxy_irr);
+
+	if (first)
+		mshv_snp_trace_dump(cpu, "watchdog", MSHV_SNP_TRACE_ENTRIES);
+}
+
+static void mshv_snp_trace_watchdog_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(mshv_snp_trace_watchdog, mshv_snp_trace_watchdog_fn);
+
+/*
+ * Runs on one CPU and inspects the others. Reading another CPU's SINT0 slot,
+ * run page and trace ring is plain memory access, so it does not disturb a
+ * CPU that is stuck in the lower VTL.
+ */
+static void mshv_snp_trace_watchdog_fn(struct work_struct *work)
+{
+	unsigned int period = READ_ONCE(snp_trace_watchdog_ms);
+	u64 stall_ns = (u64)READ_ONCE(snp_trace_stall_ms) * NSEC_PER_MSEC;
+	u64 now = ktime_get_mono_fast_ns();
+	int self = raw_smp_processor_id();
+	int cpu;
+
+	if (READ_ONCE(snp_trace) && stall_ns) {
+		for_each_online_cpu(cpu) {
+			if (cpu != self)
+				mshv_snp_trace_check_cpu(cpu, now, stall_ns);
+		}
+	}
+
+	if (period)
+		queue_delayed_work_on(self, system_wq, &mshv_snp_trace_watchdog,
+				      msecs_to_jiffies(period));
+}
+
+static void mshv_snp_trace_start(u32 mode)
+{
+	static atomic_t started = ATOMIC_INIT(0);
+	unsigned int period = READ_ONCE(snp_trace_watchdog_ms);
+	int cpu;
+
+	if (likely(atomic_read(&started)) || !hv_isolation_type_snp() ||
+	    atomic_xchg(&started, 1))
+		return;
+
+	/* Pin the watchdog to the last CPU; its timer keeps that CPU from stalling. */
+	cpu = cpumask_last(cpu_online_mask);
+	pr_info("mshv_vtl: snp-trace enabled=%d stall_ms=%u watchdog_ms=%u watchdog_cpu=%d enter_mode=%#x nohz_full=%d online=%u intercept_page=%u\n",
+		READ_ONCE(snp_trace), READ_ONCE(snp_trace_stall_ms), period, cpu, mode,
+		tick_nohz_full_enabled(), num_online_cpus(),
+		mshv_vsm_capabilities.intercept_page_available);
+
+	if (period && num_online_cpus() > 1)
+		queue_delayed_work_on(cpu, system_wq, &mshv_snp_trace_watchdog,
+				      msecs_to_jiffies(period));
+}
+
+#else
+
+#define SNP_TR_EINTR	0
+#define SNP_TR_IPI	0
+static inline void mshv_snp_trace_rec(u8 kind, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {}
+static inline void mshv_snp_trace_flush(void) {}
+static inline void mshv_snp_trace_count_isr(void) {}
+static inline void mshv_snp_trace_isr(struct hv_message *msg, u32 message_type, u64 action) {}
+static inline void mshv_snp_trace_start(u32 mode) {}
+
+#endif /* CONFIG_X86_64 && CONFIG_SEV_GUEST */
+
 #if defined(CONFIG_X86_64)
 
 #if defined(CONFIG_INTEL_TDX_GUEST)
@@ -600,12 +1051,19 @@ static int mshv_update_proxy_irr_for_icr_write(u32 icr_lo, struct cpumask *local
 static int mshv_snp_handle_simple_icr_write(u32 icr_lo, u32 dest)
 {
 	struct cpumask local_mask;
+	unsigned long targets;
 	int ret;
 
 	ret = mshv_cpu_mask_for_icr_write(icr_lo, dest, &local_mask);
-	if (ret)
+	if (ret) {
+		mshv_snp_trace_rec(SNP_TR_IPI, icr_lo, dest, 0, 0, (u64)ret, smp_processor_id());
 		return ret;
+	}
+	targets = cpumask_bits(&local_mask)[0];
 	ret = mshv_update_proxy_irr_for_icr_write(icr_lo, &local_mask);
+	/* "kicked" is the set of CPUs that were sent a RESCHEDULE_VECTOR IPI. */
+	mshv_snp_trace_rec(SNP_TR_IPI, icr_lo, dest, targets, cpumask_bits(&local_mask)[0],
+			   (u64)ret, smp_processor_id());
 	if (ret)
 		return ret;
 
@@ -826,6 +1284,10 @@ static void mshv_vtl_synic_enable_regs(unsigned int cpu)
 		hv_set_msr(HV_MSR_SINT0 + HV_SYNIC_INTERCEPTION_SINT_INDEX,
 			   sint.as_uint64);
 
+	if (hv_isolation_type_snp())
+		pr_info("mshv_vtl: cpu%u SINT0 wrote %#llx read %#llx\n", cpu, sint.as_uint64,
+			hv_get_msr(HV_MSR_SINT0 + HV_SYNIC_INTERCEPTION_SINT_INDEX));
+
 	/* VTL2 Host VSP SINT is (un)masked when the user mode requests that */
 }
 
@@ -898,13 +1360,16 @@ static void mshv_vtl_scan_proxy_interrupts(struct hv_per_cpu_context *per_cpu)
 
 		if (message_type != HVMSG_X64_PROXY_INTERRUPT_INTERCEPT) {
 			/* SNP exit dispatch consumes non-proxy messages. */
-			if (hv_isolation_type_snp())
+			if (hv_isolation_type_snp()) {
+				mshv_snp_trace_isr(msg, message_type, 2);
 				break;
+			}
 			WARN_ONCE(1, "Unexpected message type: %d\n", message_type);
 			vmbus_signal_eom(msg, message_type);
 			continue;
 		}
 
+		mshv_snp_trace_isr(msg, message_type, 1);
 		proxy = (struct hv_x64_proxy_interrupt_message_payload *)msg->u.payload;
 		run = mshv_vtl_this_run();
 
@@ -941,6 +1406,7 @@ static void mshv_vtl_vmbus_isr(void)
 	u16 i;
 
 	per_cpu = this_cpu_ptr(hv_context.cpu_context);
+	mshv_snp_trace_count_isr();
 	if (smp_processor_id() == 0) {
 		msg = (struct hv_message *)per_cpu->synic_message_page + VTL2_VMBUS_SINT_INDEX;
 		message_type = READ_ONCE(msg->header.message_type);
@@ -2109,11 +2575,17 @@ static void mshv_vtl_switch_to_vtl0_irqoff(void)
 #endif
 	} if (hv_isolation_type_snp()) {
 #if defined(CONFIG_SEV_GUEST)
+		u8 vtl = target_vtl.use_target_vtl ? target_vtl.target_vtl : 0;
+
 		if (unlikely(flags & MSHV_VTL_RUN_FLAG_HALTED)) {
+			mshv_snp_trace_enter(this_run, vtl, true);
 			native_safe_halt();
+			mshv_snp_trace_return(this_run, vtl, true);
 		} else {
 			this_cpu_write(mshv_vtl_lower_vtl_ran, true);
-			snp_mshv_vtl_return(target_vtl.use_target_vtl ? target_vtl.target_vtl : 0);
+			mshv_snp_trace_enter(this_run, vtl, false);
+			snp_mshv_vtl_return(vtl);
+			mshv_snp_trace_return(this_run, vtl, false);
 			this_cpu_inc(num_vtl0_transitions);
 		}
 		return;
@@ -2660,12 +3132,14 @@ static bool mshv_snp_try_handle_synic_message(struct mshv_vtl_run *run,
 		goto to_user;
 	}
 
+	mshv_snp_trace_msg(msg, msg_type, false);
 	vmbus_signal_eom(msg, msg_type);
 
 	return true;
 
 to_user:
 	memcpy(run->exit_message, msg, sizeof(*msg));
+	mshv_snp_trace_msg(msg, msg_type, true);
 	vmbus_signal_eom(msg, msg_type);
 	return false;
 }
@@ -2707,6 +3181,7 @@ static int mshv_vtl_ioctl_return_to_lower_vtl(void)
 	mode = READ_ONCE(mshv_vtl_this_run()->enter_mode);
 	enter = enter_mode(mode);
 	reenter = reenter_mode(mode);
+	mshv_snp_trace_start(mode);
 
 	for (;;) {
 		unsigned long irq_flags;
@@ -2724,7 +3199,14 @@ static int mshv_vtl_ioctl_return_to_lower_vtl(void)
 		local_irq_save(irq_flags);
 		if (READ_ONCE(mshv_vtl_this_run()->cancel) ||
 		    mshv_pull_proxy_irr(mshv_vtl_this_run())) {
+			struct mshv_vtl_run *run = mshv_vtl_this_run();
+
 			local_irq_restore(irq_flags);
+			mshv_snp_trace_rec(SNP_TR_EINTR, READ_ONCE(run->cancel),
+					   READ_ONCE(run->scan_proxy_irr),
+					   READ_ONCE(run->flags) |
+					   (u64)READ_ONCE(run->offload_flags) << 32, 0, 0, 0);
+			mshv_snp_trace_flush();
 			preempt_enable();
 			return -EINTR;
 		}
@@ -2733,8 +3215,14 @@ static int mshv_vtl_ioctl_return_to_lower_vtl(void)
 			struct mshv_vtl_run *run = mshv_vtl_this_run();
 
 			if (mshv_snp_synic_message_pending()) {
+				bool handled;
+
 				local_irq_restore(irq_flags);
-				if (!mshv_snp_try_handle_synic_message(run, true))
+				handled = mshv_snp_try_handle_synic_message(run, true);
+				mshv_snp_trace_rec(SNP_TR_PRE_MSG, handled, 0, 0, 0, 0,
+						   mshv_snp_trace_user_msg(run));
+				mshv_snp_trace_flush();
+				if (!handled)
 					goto done;
 				continue;
 			}
@@ -2788,6 +3276,13 @@ static int mshv_vtl_ioctl_return_to_lower_vtl(void)
 
 			vmsa_handled = mshv_snp_try_handle_exit(run, lower_vtl_ran);
 			synic_handled = mshv_snp_try_handle_synic_message(run, vmsa_handled);
+			mshv_snp_trace_rec(SNP_TR_DISPATCH, vmsa_handled, synic_handled,
+					   lower_vtl_ran,
+					   READ_ONCE(run->flags) |
+					   (u64)READ_ONCE(run->offload_flags) << 32,
+					   mshv_snp_trace_exit_code(),
+					   mshv_snp_trace_user_msg(run));
+			mshv_snp_trace_flush();
 			if (vmsa_handled && synic_handled)
 				continue; /* Exit handled entirely in kernel */
 			goto done;
