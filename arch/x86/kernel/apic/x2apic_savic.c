@@ -477,4 +477,36 @@ static struct apic apic_x2apic_savic __ro_after_init = {
 	.update_vector			= savic_update_vector,
 };
 
+/*
+ * Diagnostics only: plain reads of @cpu's backing page, so it can be called
+ * for a CPU that is not currently running VTL2 code without disturbing it.
+ */
+u32 x2apic_savic_vector_state(unsigned int cpu, unsigned int vector, bool full)
+{
+	u32 state = X2APIC_SAVIC_VEC_VALID;
+	int vec;
+
+	if (!savic_page || apic != &apic_x2apic_savic || vector >= NR_VECTORS)
+		return 0;
+
+	if (apic_test_vector(vector, get_reg_bitmap(cpu, APIC_IRR)))
+		state |= X2APIC_SAVIC_VEC_IRR;
+	if (apic_test_vector(vector, get_reg_bitmap(cpu, APIC_ISR)))
+		state |= X2APIC_SAVIC_VEC_ISR;
+	if (apic_test_vector(vector, get_reg_bitmap(cpu, SAVIC_ALLOWED_IRR)))
+		state |= X2APIC_SAVIC_VEC_ALLOWED;
+	if (!full)
+		return state;
+
+	vec = apic_find_highest_vector(get_reg_bitmap(cpu, APIC_IRR));
+	if (vec >= 0)
+		state |= X2APIC_SAVIC_IRR_ANY | (u32)vec << 8;
+	vec = apic_find_highest_vector(get_reg_bitmap(cpu, APIC_ISR));
+	if (vec >= 0)
+		state |= X2APIC_SAVIC_ISR_ANY | (u32)vec << 16;
+	state |= (apic_get_reg(get_reg_bitmap(cpu, 0), APIC_TASKPRI) & 0xff) << 24;
+
+	return state;
+}
+
 apic_driver(apic_x2apic_savic);

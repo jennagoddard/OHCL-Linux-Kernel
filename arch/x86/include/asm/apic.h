@@ -241,10 +241,28 @@ static inline u64 native_x2apic_icr_read(void)
 	return val;
 }
 
+/*
+ * Diagnostic snapshot of a vector in a CPU's Secure AVIC backing page, as
+ * returned by x2apic_savic_vector_state(): bits 0-7 are flags and, if @full,
+ * bits 8-15 the highest vector in APIC_IRR, bits 16-23 the highest vector in
+ * APIC_ISR and bits 24-31 the TPR.
+ */
+#define X2APIC_SAVIC_VEC_VALID		BIT(0)
+#define X2APIC_SAVIC_VEC_IRR		BIT(1)
+#define X2APIC_SAVIC_VEC_ISR		BIT(2)
+#define X2APIC_SAVIC_VEC_ALLOWED	BIT(3)
+#define X2APIC_SAVIC_IRR_ANY		BIT(4)
+#define X2APIC_SAVIC_ISR_ANY		BIT(5)
+
 #if defined(CONFIG_AMD_SECURE_AVIC)
 extern void x2apic_savic_init_backing_page(void *backing_page);
+u32 x2apic_savic_vector_state(unsigned int cpu, unsigned int vector, bool full);
 #else
 static inline void x2apic_savic_init_backing_page(void *backing_page) {}
+static inline u32 x2apic_savic_vector_state(unsigned int cpu, unsigned int vector, bool full)
+{
+	return 0;
+}
 #endif
 
 extern int x2apic_mode;
